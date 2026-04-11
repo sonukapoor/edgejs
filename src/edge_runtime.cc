@@ -2926,15 +2926,31 @@ int RunScriptWithGlobals(napi_env env,
   const char* process_state_switch_module = mode == EdgeBootstrapMode::kWorkerThread
                                                 ? "internal/bootstrap/switches/does_not_own_process_state"
                                                 : "internal/bootstrap/switches/does_own_process_state";
-  if (!execute_bootstrapper("internal/bootstrap/node", nullptr) ||
-      !execute_bootstrapper("internal/bootstrap/web/exposed-wildcard", nullptr) ||
-      !execute_bootstrapper("internal/bootstrap/web/exposed-window-or-worker", nullptr) ||
-      !execute_bootstrapper(thread_switch_module, nullptr) ||
-      !execute_bootstrapper(process_state_switch_module, nullptr)) {
+  if (!execute_bootstrapper("internal/bootstrap/node", nullptr)) {
     if (should_abort_worker_bootstrap()) return 1;
     return 1;
   }
-  startup_trace.Mark("bootstrap.node-and-web");
+  startup_trace.Mark("bootstrap.node");
+  if (!execute_bootstrapper("internal/bootstrap/web/exposed-wildcard", nullptr)) {
+    if (should_abort_worker_bootstrap()) return 1;
+    return 1;
+  }
+  startup_trace.Mark("bootstrap.web.exposed-wildcard");
+  if (!execute_bootstrapper("internal/bootstrap/web/exposed-window-or-worker", nullptr)) {
+    if (should_abort_worker_bootstrap()) return 1;
+    return 1;
+  }
+  startup_trace.Mark("bootstrap.web.exposed-window-or-worker");
+  if (!execute_bootstrapper(thread_switch_module, nullptr)) {
+    if (should_abort_worker_bootstrap()) return 1;
+    return 1;
+  }
+  startup_trace.Mark("bootstrap.switch.thread");
+  if (!execute_bootstrapper(process_state_switch_module, nullptr)) {
+    if (should_abort_worker_bootstrap()) return 1;
+    return 1;
+  }
+  startup_trace.Mark("bootstrap.switch.process-state");
 
   // Bridge V8 host dynamic import (napi/v8) into Node's module_wrap callback
   // registry so import('node:...') from CJS follows Node's ESM pathway.
