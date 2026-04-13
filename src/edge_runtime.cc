@@ -111,6 +111,8 @@ class StartupPhaseTracer {
               << delta_ms << ",\"total_ms\":" << total_ms << "}\n";
   }
 
+  bool enabled() const { return enabled_; }
+
  private:
   static double DurationMs(std::chrono::steady_clock::time_point start,
                            std::chrono::steady_clock::time_point end) {
@@ -121,6 +123,49 @@ class StartupPhaseTracer {
   std::chrono::steady_clock::time_point process_start_;
   std::chrono::steady_clock::time_point phase_start_;
 };
+
+struct NodeBootstrapTraceHookData {
+  StartupPhaseTracer* tracer = nullptr;
+};
+
+napi_value NodeBootstrapTraceMarkCallback(napi_env env, napi_callback_info info) {
+  napi_value undefined = nullptr;
+  (void)napi_get_undefined(env, &undefined);
+  if (env == nullptr) return undefined;
+
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  void* data = nullptr;
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, &data) != napi_ok) {
+    return undefined;
+  }
+  auto* hook_data = static_cast<NodeBootstrapTraceHookData*>(data);
+  if (hook_data == nullptr || hook_data->tracer == nullptr || argc < 1 || argv[0] == nullptr) {
+    return undefined;
+  }
+
+  napi_valuetype value_type = napi_undefined;
+  if (napi_typeof(env, argv[0], &value_type) != napi_ok || value_type != napi_string) {
+    return undefined;
+  }
+
+  size_t length = 0;
+  if (napi_get_value_string_utf8(env, argv[0], nullptr, 0, &length) != napi_ok) {
+    return undefined;
+  }
+  std::string suffix(length, '\0');
+  size_t copied = 0;
+  if (napi_get_value_string_utf8(env, argv[0], suffix.data(), suffix.size() + 1, &copied) != napi_ok) {
+    return undefined;
+  }
+  suffix.resize(copied);
+  if (suffix.empty()) return undefined;
+
+  std::string phase = "bootstrap.node.";
+  phase += suffix;
+  hook_data->tracer->Mark(phase.c_str());
+  return undefined;
+}
 
 void ResetDomainHelperRef(napi_env env, napi_ref* ref);
 
@@ -2926,15 +2971,56 @@ int RunScriptWithGlobals(napi_env env,
   const char* process_state_switch_module = mode == EdgeBootstrapMode::kWorkerThread
                                                 ? "internal/bootstrap/switches/does_not_own_process_state"
                                                 : "internal/bootstrap/switches/does_own_process_state";
-  if (!execute_bootstrapper("internal/bootstrap/node", nullptr) ||
-      !execute_bootstrapper("internal/bootstrap/web/exposed-wildcard", nullptr) ||
-      !execute_bootstrapper("internal/bootstrap/web/exposed-window-or-worker", nullptr) ||
-      !execute_bootstrapper(thread_switch_module, nullptr) ||
-      !execute_bootstrapper(process_state_switch_module, nullptr)) {
+  bool installed_node_trace_hook = false;
+  NodeBootstrapTraceHookData node_trace_hook_data{&startup_trace};
+  if (startup_trace.enabled()) {
+    napi_value node_trace_fn = nullptr;
+    if (napi_create_function(env,
+                             "__edgeStartupTraceMark",
+                             NAPI_AUTO_LENGTH,
+                             NodeBootstrapTraceMarkCallback,
+                             &node_trace_hook_data,
+                             &node_trace_fn) == napi_ok &&
+        node_trace_fn != nullptr) {
+      installed_node_trace_hook = define_hidden_global("__edgeStartupTraceMark", node_trace_fn);
+    }
+  }
+  if (!execute_bootstrapper("internal/bootstrap/node", nullptr)) {
     if (should_abort_worker_bootstrap()) return 1;
     return 1;
   }
-  startup_trace.Mark("bootstrap.node-and-web");
+  if (installed_node_trace_hook) {
+    napi_value node_trace_key = nullptr;
+    if (napi_create_string_utf8(env,
+                                "__edgeStartupTraceMark",
+                                NAPI_AUTO_LENGTH,
+                                &node_trace_key) == napi_ok &&
+        node_trace_key != nullptr) {
+      bool deleted = false;
+      (void)napi_delete_property(env, global, node_trace_key, &deleted);
+    }
+  }
+  startup_trace.Mark("bootstrap.node");
+  if (!execute_bootstrapper("internal/bootstrap/web/exposed-wildcard", nullptr)) {
+    if (should_abort_worker_bootstrap()) return 1;
+    return 1;
+  }
+  startup_trace.Mark("bootstrap.web.exposed-wildcard");
+  if (!execute_bootstrapper("internal/bootstrap/web/exposed-window-or-worker", nullptr)) {
+    if (should_abort_worker_bootstrap()) return 1;
+    return 1;
+  }
+  startup_trace.Mark("bootstrap.web.exposed-window-or-worker");
+  if (!execute_bootstrapper(thread_switch_module, nullptr)) {
+    if (should_abort_worker_bootstrap()) return 1;
+    return 1;
+  }
+  startup_trace.Mark("bootstrap.switch.thread");
+  if (!execute_bootstrapper(process_state_switch_module, nullptr)) {
+    if (should_abort_worker_bootstrap()) return 1;
+    return 1;
+  }
+  startup_trace.Mark("bootstrap.switch.process-state");
 
   // Bridge V8 host dynamic import (napi/v8) into Node's module_wrap callback
   // registry so import('node:...') from CJS follows Node's ESM pathway.
@@ -3622,12 +3708,19 @@ int EdgeRunWorkerThreadMain(napi_env env,
       EdgeBootstrapMode::kWorkerThread);
 }
 
-bool EdgeInitializeOpenSslForCli(std::string* error_out) {
-  const edge_options::EffectiveCliState state = edge_options::BuildEffectiveCliState(g_edge_cli_exec_argv);
-  const std::vector<std::string>& exec_argv = state.ok ? state.effective_tokens : g_edge_cli_exec_argv;
+bool EdgeInitializeOpenSslForExecArgv(const std::vector<std::string>& exec_argv,
+                                      bool validate_csprng,
+                                      std::string* error_out) {
   if (!ConfigureOpenSslFromExecArgv(exec_argv, error_out)) {
     return false;
   }
+  if (!validate_csprng) {
+    return true;
+  }
+  return EdgeValidateOpenSslCsprng();
+}
+
+bool EdgeValidateOpenSslCsprng() {
   // Match Node's startup behavior closely enough to fail fast when the loaded
   // provider configuration leaves no usable CSPRNG implementation.
   if (!ncrypto::CSPRNG(nullptr, 0)) {
